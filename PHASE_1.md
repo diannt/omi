@@ -29,7 +29,8 @@ Device → Host (1 byte):  [0x64=EOT]
 
 ## Roadblocks
 - `clang-format` not installed in WSL — deferred to pre-commit hook
-- Firmware build deferred: `west` + nRF Connect SDK 2.9 not installed (~1.5 GB). User builds via `nrfutil toolchain-manager` per `omi/firmware/BUILD_AND_OTA_FLASH.md` then OTA DFU via nRF Connect mobile app.
+- Firmware build deferred to P6 (toolchain IS present at `~/ncs` — initially overlooked, corrected post-commit)
+- Flash path undetermined: `nrfutil` not installed, SWD availability unknown, device's current CDC endpoint purpose unknown (console? mcumgr?)
 
 ## Test Output
 
@@ -55,11 +56,35 @@ PASS: EOT marker confirmed
 [usb_dump] done: 262144 bytes → /tmp/usb_dump_test.bin in 0.01s @ 19.30 MB/s
 ```
 
-## Firmware Build (user action)
-```bash
-cd omi/firmware/v2.9.0
-west build -b omi/nrf5340/cpuapp ../omi --sysbuild -- -DBOARD_ROOT=$(pwd)/..
-# Output: build/dfu_application.zip → transfer to phone → nRF Connect DFU
+## Firmware Build & Flash — DEFERRED TO PHASE 6
+
+**Environment inventory (probed 2026-03-05 18:57):**
+| Tool | Status | Path |
+|---|---|---|
+| west | ✅ v1.5.0 | PATH |
+| nRF Connect SDK | ✅ 2.9.0 | `~/ncs/{zephyr,nrf,nrfxlib,bootloader}` |
+| Zephyr SDK toolchain | ✅ arm-zephyr-eabi | `~/zephyr-sdk*` |
+| openocd | ✅ | `/usr/bin/openocd` |
+| nrfutil | ❌ not installed | — |
+| **Device** | ✅ enumerated | `/dev/ttyACM0` (VID:PID `2fe3:0100 NordicSemiconductor USB-DEV`) |
+
+**Live device probe:**
+```python
+# Sent 6-byte READ cmd [0x00 0x01 0x00 0x00 0x00 0x00] to /dev/ttyACM0
+# → 0 bytes response
 ```
+Current firmware does NOT speak storage protocol over CDC. The `2fe3:0100` enumeration is from existing firmware (USB console or MCUboot serial recovery), NOT from `usb_dump.c`. **Build + flash required.**
+
+**Scheduled for P6** alongside E2E pipeline test. Build command (no user action — runs in WSL):
+```bash
+cd ~/ncs && west build -b omi/nrf5340/cpuapp \
+  ~/dev/code_pref/model_b/omi/firmware/omi --sysbuild \
+  -- -DBOARD_ROOT=~/dev/code_pref/model_b/omi/firmware
+```
+
+**Flash path — OPEN QUESTION (see P1 feedback request):**
+- openocd + SWD → needs SWD pins exposed on device
+- MCUboot serial recovery → if current CDC is mcumgr, can `mcumgr image upload` over `/dev/ttyACM0`
+- BLE DFU via nRF Connect mobile app → only path that is **actual user action** (physical phone)
 
 **End:** 2026-03-05 18:54:48
