@@ -26,6 +26,9 @@
 #include "lib/core/sd_card.h"
 #include "spi_flash.h"
 #include "wdog_facade.h"
+#ifdef CONFIG_OMI_ENABLE_USB_DUMP
+#include "usb_dump.h"
+#endif
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -295,6 +298,15 @@ int main(void)
         // Non-critical, continue boot
     } else {
         LOG_INF("Storage service initialized");
+    }
+#endif
+
+#ifdef CONFIG_OMI_ENABLE_USB_DUMP
+    ret = usb_dump_init();
+    if (ret) {
+        LOG_WRN("USB dump init failed (err %d), continuing without USB dump", ret);
+    } else {
+        LOG_INF("USB dump initialized");
     }
 #endif
 

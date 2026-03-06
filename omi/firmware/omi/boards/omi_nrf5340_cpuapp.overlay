@@ -1,0 +1,18 @@
+/*
+ * App-level overlay: enable USB CDC-ACM for bulk SD dumps.
+ * Picked up automatically by Zephyr for board "omi/nrf5340/cpuapp".
+ */
+
+/ {
+	chosen {
+		/* Keep console on uart0 — CDC is data-only */
+	};
+};
+
+&zephyr_udc0 {
+	status = "okay";
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "CDC_ACM_0";
+	};
+};

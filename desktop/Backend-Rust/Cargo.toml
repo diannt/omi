@@ -55,3 +55,17 @@ urlencoding = "2.1"
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 # Note: Using Firestore REST API directly instead of gcloud-sdk for compatibility
+
+# --- USB dump + local pipeline (Phase 1-4) ---
+serialport = "4.3"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+petgraph = "0.6"
+
+[[bin]]
+name = "usb_dump"
+path = "src/bin/usb_dump.rs"
+
+[[bin]]
+name = "full_pipeline"
+path = "src/bin/full_pipeline.rs"

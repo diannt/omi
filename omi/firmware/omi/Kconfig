@@ -69,4 +69,15 @@ config OMI_ENABLE_WIFI
         "Enable the WiFi support to sync audio data over TCP."
     default n
 
+config OMI_ENABLE_USB_DUMP
+    bool "Enable USB CDC bulk dump"
+    help
+        "Enable USB CDC-ACM endpoint for fast SD card dumps over serial."
+    default n
+    depends on OMI_ENABLE_OFFLINE_STORAGE
+    select USB_DEVICE_STACK
+    select USB_CDC_ACM
+    select UART_INTERRUPT_DRIVEN
+    select UART_LINE_CTRL
+
 endmenu

@@ -34,6 +34,10 @@ if(CONFIG_OMI_ENABLE_WIFI)
     list(APPEND core_sources src/wifi.c)
 endif()
 
+if(CONFIG_OMI_ENABLE_USB_DUMP)
+    list(APPEND app_sources src/usb_dump.c)
+endif()
+
 target_sources(app PRIVATE ${core_sources} ${app_sources})
 target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
