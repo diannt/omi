@@ -76,7 +76,7 @@ pub use persona::{
 };
 pub use llm_usage::{RecordLlmUsageRequest, RecordLlmUsageResponse};
 pub use knowledge_graph::{
-    ExtractedKnowledge, KnowledgeGraphEdge,
-    KnowledgeGraphNode, KnowledgeGraphResponse, KnowledgeGraphStatusResponse, NodeType,
-    RebuildGraphResponse,
+    ClusterInfoDto, EnrichedEdgeDto, EnrichedGraphResponse, EnrichedNodeDto, ExtractedKnowledge,
+    KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphResponse, KnowledgeGraphStatusResponse,
+    NodeType, RebuildGraphResponse,
 };

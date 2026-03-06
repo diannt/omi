@@ -174,3 +174,49 @@ pub struct KnowledgeGraphStatusResponse {
     pub success: bool,
     pub message: String,
 }
+
+// ============================================================================
+// Enriched graph (clustering + centrality) — P4
+// ============================================================================
+
+/// Node with analytics scores layered on the base KG node.
+/// Flattened serialization so Swift sees all base fields (including `memory_ids`)
+/// at the top level alongside the centrality/cluster fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrichedNodeDto {
+    #[serde(flatten)]
+    pub base: KnowledgeGraphNode,
+    pub cluster_id: u32,
+    pub degree_centrality: f64,
+    pub betweenness_centrality: f64,
+    pub closeness_centrality: f64,
+}
+
+/// Edge with accumulated co-occurrence weight (= memory_ids.len() for Firestore,
+/// = row multiplicity for local SQLite).
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrichedEdgeDto {
+    #[serde(flatten)]
+    pub base: KnowledgeGraphEdge,
+    pub weight: f32,
+}
+
+/// Cluster summary: hub-node label + dominant entity type.
+/// Duplicated here (rather than re-exporting from `graph_analytics`)
+/// to keep `models` independent of `services`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterInfoDto {
+    pub id: u32,
+    pub label: String,
+    pub node_count: usize,
+    pub dominant_type: String,
+}
+
+/// Full enriched graph response for the persona-profile view.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrichedGraphResponse {
+    pub nodes: Vec<EnrichedNodeDto>,
+    pub edges: Vec<EnrichedEdgeDto>,
+    pub clusters: Vec<ClusterInfoDto>,
+    pub modularity: f32,
+}

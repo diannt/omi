@@ -399,6 +399,230 @@ pub fn load_local_kg(db_path: &Path) -> SqlResult<(Vec<KgNode>, Vec<KgEdge>)> {
 }
 
 // ===========================================================================
+// Centrality measures
+// ===========================================================================
+
+/// Normalized degree centrality: `deg(v) / (n-1)`.
+/// For isolated nodes or n<2 returns 0.
+pub fn degree_centrality(g: &UnGraph<String, f32>) -> HashMap<NodeIndex, f64> {
+    let n = g.node_count();
+    if n < 2 {
+        return g.node_indices().map(|ix| (ix, 0.0)).collect();
+    }
+    let denom = (n - 1) as f64;
+    g.node_indices()
+        .map(|ix| (ix, g.edges(ix).count() as f64 / denom))
+        .collect()
+}
+
+/// Closeness centrality with Wasserman-Faust correction for disconnected graphs:
+/// `C(v) = (r-1)/(n-1) · (r-1)/Σd(v,u)` where r = number of reachable nodes.
+/// Unweighted BFS (edge weights ignored — KG edges are co-occurrence counts,
+/// not distances).
+pub fn closeness_centrality(g: &UnGraph<String, f32>) -> HashMap<NodeIndex, f64> {
+    let n = g.node_count();
+    let mut out = HashMap::with_capacity(n);
+    if n < 2 {
+        for ix in g.node_indices() {
+            out.insert(ix, 0.0);
+        }
+        return out;
+    }
+    let n_minus_1 = (n - 1) as f64;
+
+    for src in g.node_indices() {
+        // BFS
+        let mut dist: HashMap<NodeIndex, u32> = HashMap::new();
+        let mut queue = std::collections::VecDeque::new();
+        dist.insert(src, 0);
+        queue.push_back(src);
+        while let Some(u) = queue.pop_front() {
+            let d = dist[&u];
+            for v in g.neighbors(u) {
+                if !dist.contains_key(&v) {
+                    dist.insert(v, d + 1);
+                    queue.push_back(v);
+                }
+            }
+        }
+        let reach = dist.len(); // includes src itself
+        let sum_d: u64 = dist.values().map(|&d| d as u64).sum();
+        if reach < 2 || sum_d == 0 {
+            out.insert(src, 0.0);
+        } else {
+            let r_minus_1 = (reach - 1) as f64;
+            // Wasserman-Faust: scale by fraction reachable
+            out.insert(src, (r_minus_1 / n_minus_1) * (r_minus_1 / sum_d as f64));
+        }
+    }
+    out
+}
+
+/// Brandes' betweenness centrality, O(V·E) for unweighted graphs.
+/// Normalized for undirected: divide by `(n-1)(n-2)/2` so values are in [0,1].
+pub fn betweenness_centrality(g: &UnGraph<String, f32>) -> HashMap<NodeIndex, f64> {
+    let n = g.node_count();
+    let mut bc: HashMap<NodeIndex, f64> = g.node_indices().map(|ix| (ix, 0.0)).collect();
+    if n < 3 {
+        return bc;
+    }
+
+    for s in g.node_indices() {
+        // Single-source shortest-path BFS
+        let mut stack: Vec<NodeIndex> = Vec::new();
+        let mut pred: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
+        let mut sigma: HashMap<NodeIndex, f64> = HashMap::new();
+        let mut dist: HashMap<NodeIndex, i32> = HashMap::new();
+
+        for v in g.node_indices() {
+            pred.insert(v, Vec::new());
+            sigma.insert(v, 0.0);
+            dist.insert(v, -1);
+        }
+        sigma.insert(s, 1.0);
+        dist.insert(s, 0);
+
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(s);
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let dv = dist[&v];
+            for w in g.neighbors(v) {
+                if dist[&w] < 0 {
+                    dist.insert(w, dv + 1);
+                    queue.push_back(w);
+                }
+                if dist[&w] == dv + 1 {
+                    let sv = sigma[&v];
+                    *sigma.get_mut(&w).unwrap() += sv;
+                    pred.get_mut(&w).unwrap().push(v);
+                }
+            }
+        }
+
+        // Accumulate dependencies in reverse BFS order
+        let mut delta: HashMap<NodeIndex, f64> = g.node_indices().map(|ix| (ix, 0.0)).collect();
+        while let Some(w) = stack.pop() {
+            let coeff = (1.0 + delta[&w]) / sigma[&w];
+            for &v in &pred[&w] {
+                *delta.get_mut(&v).unwrap() += sigma[&v] * coeff;
+            }
+            if w != s {
+                *bc.get_mut(&w).unwrap() += delta[&w];
+            }
+        }
+    }
+
+    // Normalize: undirected counts each pair twice (once per endpoint as source)
+    // Standard normalization: divide by (n-1)(n-2) to map to [0,1]
+    let norm = ((n - 1) * (n - 2)) as f64;
+    for v in bc.values_mut() {
+        *v /= norm;
+    }
+    bc
+}
+
+// ===========================================================================
+// Enrichment orchestrator
+// ===========================================================================
+
+/// Full enriched node — base identity plus analytics scores.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnrichedNode {
+    pub id: String,
+    pub label: String,
+    pub node_type: String,
+    pub cluster_id: u32,
+    pub degree_centrality: f64,
+    pub betweenness_centrality: f64,
+    pub closeness_centrality: f64,
+}
+
+/// Enriched edge — collapsed undirected edge with accumulated weight.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnrichedEdge {
+    pub source_id: String,
+    pub target_id: String,
+    pub weight: f32,
+}
+
+/// Output of the full enrichment pipeline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnrichedGraph {
+    pub nodes: Vec<EnrichedNode>,
+    pub edges: Vec<EnrichedEdge>,
+    pub clusters: Vec<ClusterInfo>,
+    pub modularity: f32,
+}
+
+/// Run the full pipeline: build graph → Louvain → centralities → label clusters.
+/// One-stop entry point for the `/enriched` API route.
+pub fn enrich_graph(nodes: &[KgNode], edges: &[KgEdge]) -> EnrichedGraph {
+    let (g, idx_map) = build_graph(nodes, edges);
+
+    if g.node_count() == 0 {
+        return EnrichedGraph {
+            nodes: vec![],
+            edges: vec![],
+            clusters: vec![],
+            modularity: 0.0,
+        };
+    }
+
+    let (communities, _k) = louvain_communities(&g);
+    let q = modularity(&g, &communities);
+    let deg = degree_centrality(&g);
+    let bet = betweenness_centrality(&g);
+    let clo = closeness_centrality(&g);
+    let clusters = label_clusters(&g, &idx_map, nodes, &communities);
+
+    // Reverse map for node output
+    let ix_to_id: HashMap<NodeIndex, &str> =
+        idx_map.iter().map(|(id, &ix)| (ix, id.as_str())).collect();
+
+    let mut enriched_nodes: Vec<EnrichedNode> = nodes
+        .iter()
+        .filter_map(|n| {
+            let ix = *idx_map.get(&n.id)?;
+            Some(EnrichedNode {
+                id: n.id.clone(),
+                label: n.label.clone(),
+                node_type: n.node_type.clone(),
+                cluster_id: *communities.get(&ix).unwrap_or(&0),
+                degree_centrality: deg.get(&ix).copied().unwrap_or(0.0),
+                betweenness_centrality: bet.get(&ix).copied().unwrap_or(0.0),
+                closeness_centrality: clo.get(&ix).copied().unwrap_or(0.0),
+            })
+        })
+        .collect();
+    // Stable ordering for reproducible API responses
+    enriched_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut enriched_edges: Vec<EnrichedEdge> = g
+        .edge_references()
+        .map(|e| {
+            let a = ix_to_id[&e.source()];
+            let b = ix_to_id[&e.target()];
+            // Canonicalize so edges are stable regardless of petgraph internals
+            let (s, t) = if a <= b { (a, b) } else { (b, a) };
+            EnrichedEdge {
+                source_id: s.to_string(),
+                target_id: t.to_string(),
+                weight: *e.weight(),
+            }
+        })
+        .collect();
+    enriched_edges.sort_by(|a, b| (a.source_id.as_str(), a.target_id.as_str()).cmp(&(b.source_id.as_str(), b.target_id.as_str())));
+
+    EnrichedGraph {
+        nodes: enriched_nodes,
+        edges: enriched_edges,
+        clusters,
+        modularity: q,
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -715,5 +939,151 @@ mod tests {
         ];
         let (g, _) = build_graph(&nodes, &edges);
         assert_eq!(g.edge_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Centrality tests
+    // -----------------------------------------------------------------------
+
+    /// Star K₁,₄: hub connected to 4 leaves.
+    /// Hub: degree=4/4=1.0, betweenness=1.0 (all leaf-pairs go through hub),
+    ///      closeness=4/(1+1+1+1)=1.0
+    /// Leaf: degree=1/4=0.25, betweenness=0.0, closeness < hub
+    #[test]
+    fn star_centrality() {
+        let nodes = make_nodes(&["hub", "l1", "l2", "l3", "l4"]);
+        let edges = vec![
+            make_edge("hub", "l1"),
+            make_edge("hub", "l2"),
+            make_edge("hub", "l3"),
+            make_edge("hub", "l4"),
+        ];
+        let (g, idx) = build_graph(&nodes, &edges);
+        let deg = degree_centrality(&g);
+        let bet = betweenness_centrality(&g);
+        let clo = closeness_centrality(&g);
+
+        let hub_ix = idx["hub"];
+        let l1_ix = idx["l1"];
+
+        // Degree
+        assert!((deg[&hub_ix] - 1.0).abs() < 1e-9);
+        assert!((deg[&l1_ix] - 0.25).abs() < 1e-9);
+
+        // Betweenness: hub is on all C(4,2)=6 shortest paths between leaves.
+        // Normalized: 6 / ((n-1)(n-2)/2) = 6/6 = 1.0, but Brandes counts each
+        // pair twice (undirected → both directions), so raw=12, norm=(n-1)(n-2)=12.
+        assert!((bet[&hub_ix] - 1.0).abs() < 1e-9, "hub betweenness = {}", bet[&hub_ix]);
+        assert!((bet[&l1_ix]).abs() < 1e-9);
+
+        // Closeness: hub reaches all 4 at distance 1 → sum=4 → C=4/4=1.0
+        assert!((clo[&hub_ix] - 1.0).abs() < 1e-9);
+        // Leaf reaches hub at 1, other 3 leaves at 2 → sum=7 → C=(4/4)·(4/7)=4/7≈0.571
+        assert!((clo[&l1_ix] - 4.0 / 7.0).abs() < 1e-6);
+    }
+
+    /// Path P₅: a—b—c—d—e. Middle node c has highest betweenness.
+    #[test]
+    fn path_centrality() {
+        let nodes = make_nodes(&["a", "b", "c", "d", "e"]);
+        let edges = vec![
+            make_edge("a", "b"),
+            make_edge("b", "c"),
+            make_edge("c", "d"),
+            make_edge("d", "e"),
+        ];
+        let (g, idx) = build_graph(&nodes, &edges);
+        let bet = betweenness_centrality(&g);
+
+        let bc_a = bet[&idx["a"]];
+        let bc_b = bet[&idx["b"]];
+        let bc_c = bet[&idx["c"]];
+        let bc_d = bet[&idx["d"]];
+        let bc_e = bet[&idx["e"]];
+
+        // Endpoints have 0 betweenness
+        assert!(bc_a.abs() < 1e-9);
+        assert!(bc_e.abs() < 1e-9);
+        // Middle is strictly highest
+        assert!(bc_c > bc_b);
+        assert!(bc_c > bc_d);
+        // Symmetric
+        assert!((bc_b - bc_d).abs() < 1e-9);
+
+        // Exact values for P₅:
+        // b is on paths: a-c (a-b-c), a-d (a-b-c-d), a-e (a-b-c-d-e) → 3 pairs × 2 dirs = 6 raw
+        // c is on paths: a-d, a-e, b-d, b-e → 4 pairs × 2 dirs = 8 raw
+        // Normalized by (n-1)(n-2) = 12
+        assert!((bc_b - 6.0 / 12.0).abs() < 1e-9, "bc_b = {}", bc_b);
+        assert!((bc_c - 8.0 / 12.0).abs() < 1e-9, "bc_c = {}", bc_c);
+    }
+
+    /// Two disconnected K₃ triangles. Closeness uses Wasserman-Faust
+    /// so each node's closeness reflects its own component, scaled by
+    /// fraction of total graph reachable.
+    #[test]
+    fn disconnected_closeness() {
+        let nodes = make_nodes(&["a", "b", "c", "x", "y", "z"]);
+        let edges = vec![
+            make_edge("a", "b"),
+            make_edge("b", "c"),
+            make_edge("a", "c"),
+            make_edge("x", "y"),
+            make_edge("y", "z"),
+            make_edge("x", "z"),
+        ];
+        let (g, idx) = build_graph(&nodes, &edges);
+        let clo = closeness_centrality(&g);
+
+        // In a K₃: each node reaches 2 others at distance 1 → sum_d=2, r=3
+        // WF: (r-1)/(n-1) · (r-1)/sum_d = (2/5)·(2/2) = 0.4
+        for id in &["a", "b", "c", "x", "y", "z"] {
+            let c = clo[&idx[*id]];
+            assert!((c - 0.4).abs() < 1e-9, "{} closeness = {}", id, c);
+        }
+
+        // Betweenness: in a triangle, all shortest paths are direct edges,
+        // so no node is an intermediate. All betweenness = 0.
+        let bet = betweenness_centrality(&g);
+        for (_, &b) in &bet {
+            assert!(b.abs() < 1e-9);
+        }
+    }
+
+    /// enrich_graph produces a coherent response: correct node/edge counts,
+    /// every node has a cluster_id, all centralities in [0,1].
+    #[test]
+    fn enrich_two_clique() {
+        let nodes = make_nodes(&["a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3"]);
+        let mut edges = Vec::new();
+        for p in &["a", "b"] {
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    edges.push(make_edge(&format!("{p}{i}"), &format!("{p}{j}")));
+                }
+            }
+        }
+        edges.push(make_edge("a0", "b0")); // bridge
+
+        let eg = enrich_graph(&nodes, &edges);
+        assert_eq!(eg.nodes.len(), 8);
+        assert_eq!(eg.edges.len(), 13); // 6+6 clique edges + 1 bridge
+        assert_eq!(eg.clusters.len(), 2);
+        assert!(eg.modularity > 0.3);
+
+        for n in &eg.nodes {
+            assert!(n.degree_centrality >= 0.0 && n.degree_centrality <= 1.0);
+            assert!(n.betweenness_centrality >= 0.0 && n.betweenness_centrality <= 1.0);
+            assert!(n.closeness_centrality >= 0.0 && n.closeness_centrality <= 1.0);
+        }
+
+        // Bridge endpoints a0,b0 should have highest betweenness
+        let bc: HashMap<&str, f64> = eg
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.betweenness_centrality))
+            .collect();
+        assert!(bc["a0"] > bc["a1"]);
+        assert!(bc["b0"] > bc["b1"]);
     }
 }

@@ -13,9 +13,11 @@ use std::collections::HashMap;
 use crate::auth::AuthUser;
 use crate::llm::LlmClient;
 use crate::models::{
-    KnowledgeGraphEdge, KnowledgeGraphNode, KnowledgeGraphResponse, KnowledgeGraphStatusResponse,
-    NodeType, RebuildGraphResponse,
+    ClusterInfoDto, EnrichedEdgeDto, EnrichedGraphResponse, EnrichedNodeDto, KnowledgeGraphEdge,
+    KnowledgeGraphNode, KnowledgeGraphResponse, KnowledgeGraphStatusResponse, NodeType,
+    RebuildGraphResponse,
 };
+use crate::services::graph_analytics::{enrich_graph, KgEdge, KgNode};
 use crate::AppState;
 
 /// GET /v1/knowledge-graph - Get the full knowledge graph
@@ -230,6 +232,131 @@ async fn rebuild_knowledge_graph(
     }))
 }
 
+/// GET /v1/knowledge-graph/enriched - KG with Louvain clusters + centrality scores.
+/// Edge weight = memory_ids.len() (co-occurrence count).
+async fn get_enriched_graph(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<EnrichedGraphResponse>, StatusCode> {
+    tracing::info!("Getting enriched knowledge graph for user {}", user.uid);
+
+    let fs_nodes = state.firestore.get_kg_nodes(&user.uid).await.map_err(|e| {
+        tracing::error!("Failed to get KG nodes: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let fs_edges = state.firestore.get_kg_edges(&user.uid).await.map_err(|e| {
+        tracing::error!("Failed to get KG edges: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Convert Firestore models → analytics input types.
+    // Edge weight = co-occurrence count (memory_ids.len()), min 1.
+    let kg_nodes: Vec<KgNode> = fs_nodes
+        .iter()
+        .map(|n| KgNode {
+            id: n.id.clone(),
+            label: n.label.clone(),
+            node_type: n.node_type.to_string(),
+        })
+        .collect();
+    let kg_edges: Vec<KgEdge> = fs_edges
+        .iter()
+        .map(|e| KgEdge {
+            source_id: e.source_id.clone(),
+            target_id: e.target_id.clone(),
+            label: e.label.clone(),
+            weight: e.memory_ids.len().max(1) as f32,
+        })
+        .collect();
+
+    let enriched = enrich_graph(&kg_nodes, &kg_edges);
+
+    // Zip analytics scores back onto original Firestore nodes (preserving memory_ids).
+    let scores: HashMap<&str, (u32, f64, f64, f64)> = enriched
+        .nodes
+        .iter()
+        .map(|n| {
+            (
+                n.id.as_str(),
+                (
+                    n.cluster_id,
+                    n.degree_centrality,
+                    n.betweenness_centrality,
+                    n.closeness_centrality,
+                ),
+            )
+        })
+        .collect();
+
+    let out_nodes: Vec<EnrichedNodeDto> = fs_nodes
+        .into_iter()
+        .map(|base| {
+            let (cid, deg, bet, clo) = scores
+                .get(base.id.as_str())
+                .copied()
+                .unwrap_or((0, 0.0, 0.0, 0.0));
+            EnrichedNodeDto {
+                base,
+                cluster_id: cid,
+                degree_centrality: deg,
+                betweenness_centrality: bet,
+                closeness_centrality: clo,
+            }
+        })
+        .collect();
+
+    // For edges: collapsed weights from analytics, but keep original edge rows
+    // (the analytics layer collapses multi-edges, so map by unordered pair).
+    let weight_map: HashMap<(String, String), f32> = enriched
+        .edges
+        .iter()
+        .map(|e| ((e.source_id.clone(), e.target_id.clone()), e.weight))
+        .collect();
+
+    let out_edges: Vec<EnrichedEdgeDto> = fs_edges
+        .into_iter()
+        .map(|base| {
+            let (a, b) = if base.source_id <= base.target_id {
+                (base.source_id.clone(), base.target_id.clone())
+            } else {
+                (base.target_id.clone(), base.source_id.clone())
+            };
+            let weight = weight_map
+                .get(&(a, b))
+                .copied()
+                .unwrap_or_else(|| base.memory_ids.len().max(1) as f32);
+            EnrichedEdgeDto { base, weight }
+        })
+        .collect();
+
+    let out_clusters: Vec<ClusterInfoDto> = enriched
+        .clusters
+        .into_iter()
+        .map(|c| ClusterInfoDto {
+            id: c.id,
+            label: c.label,
+            node_count: c.node_count,
+            dominant_type: c.dominant_type,
+        })
+        .collect();
+
+    tracing::info!(
+        "Enriched graph for user {}: {} nodes, {} edges, {} clusters, Q={:.3}",
+        user.uid,
+        out_nodes.len(),
+        out_edges.len(),
+        out_clusters.len(),
+        enriched.modularity
+    );
+
+    Ok(Json(EnrichedGraphResponse {
+        nodes: out_nodes,
+        edges: out_edges,
+        clusters: out_clusters,
+        modularity: enriched.modularity,
+    }))
+}
+
 /// DELETE /v1/knowledge-graph - Delete the knowledge graph
 async fn delete_knowledge_graph(
     State(state): State<AppState>,
@@ -256,6 +383,7 @@ async fn delete_knowledge_graph(
 pub fn knowledge_graph_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/knowledge-graph", get(get_knowledge_graph))
+        .route("/v1/knowledge-graph/enriched", get(get_enriched_graph))
         .route("/v1/knowledge-graph/rebuild", post(rebuild_knowledge_graph))
         .route("/v1/knowledge-graph", delete(delete_knowledge_graph))
 }
