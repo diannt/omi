@@ -69,3 +69,7 @@ path = "src/bin/usb_dump.rs"
 [[bin]]
 name = "full_pipeline"
 path = "src/bin/full_pipeline.rs"
+
+[[bin]]
+name = "persona_server"
+path = "src/bin/persona_server.rs"

@@ -4,11 +4,13 @@
 use axum::{
     extract::{Query, State},
     http::StatusCode,
+    response::Html,
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::auth::AuthUser;
 use crate::llm::LlmClient;
@@ -17,7 +19,9 @@ use crate::models::{
     KnowledgeGraphNode, KnowledgeGraphResponse, KnowledgeGraphStatusResponse, NodeType,
     RebuildGraphResponse,
 };
-use crate::services::graph_analytics::{enrich_graph, KgEdge, KgNode};
+use crate::services::graph_analytics::{
+    enrich_graph, load_local_kg, EnrichedGraph, KgEdge, KgNode,
+};
 use crate::AppState;
 
 /// GET /v1/knowledge-graph - Get the full knowledge graph
@@ -379,6 +383,219 @@ async fn delete_knowledge_graph(
     }))
 }
 
+// ============================================================================
+// Local SQLite path — no Firebase auth, reads app's GRDB database directly.
+// Intended for the browser persona-profile viewer when running against the
+// desktop app's local data. The `db` query param is the full path to
+// `rewind.sqlite` (macOS: ~/Library/Application Support/Omi/rewind.sqlite).
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct LocalDbQuery {
+    pub db: String,
+}
+
+/// GET /v1/knowledge-graph/enriched-local?db=<path>
+/// Unauth'd: reads `local_kg_nodes` + `local_kg_edges` from the given SQLite
+/// file, runs full Louvain + centrality, returns the enriched graph.
+async fn get_enriched_local(
+    Query(q): Query<LocalDbQuery>,
+) -> Result<Json<EnrichedGraph>, (StatusCode, String)> {
+    let db_path = PathBuf::from(&q.db);
+    if !db_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("DB file not found: {}", q.db),
+        ));
+    }
+
+    let (nodes, edges) = load_local_kg(&db_path).map_err(|e| {
+        tracing::error!("load_local_kg({}) failed: {}", q.db, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("SQLite read failed: {}", e),
+        )
+    })?;
+
+    tracing::info!(
+        "Loaded {} nodes, {} edges from local DB {}",
+        nodes.len(),
+        edges.len(),
+        q.db
+    );
+
+    let enriched = enrich_graph(&nodes, &edges);
+
+    tracing::info!(
+        "Enriched local graph: {} clusters, Q={:.3}",
+        enriched.clusters.len(),
+        enriched.modularity
+    );
+
+    Ok(Json(enriched))
+}
+
+/// GET /persona?db=<path>
+/// Serves a single-page d3.js force-directed graph viewer. Fetches
+/// `/v1/knowledge-graph/enriched-local?db=<same>` and renders:
+///   - node color = cluster_id (categorical palette)
+///   - node radius = 4 + degree_centrality · 20
+///   - edge width = 1 + weight · 0.5 (capped)
+///   - click node → sidebar with label, type, centralities
+async fn persona_profile_page(Query(q): Query<LocalDbQuery>) -> Html<String> {
+    // Escape the db path for safe embedding in the JS string literal.
+    let db_escaped = q.db.replace('\\', "\\\\").replace('"', "\\\"");
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Persona Profile — Knowledge Graph</title>
+  <style>
+    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; height: 100vh; background: #0a0a0f; color: #e4e4e7; }}
+    #graph {{ flex: 1; }}
+    #sidebar {{ width: 320px; padding: 16px; background: #18181b; border-left: 1px solid #27272a; overflow-y: auto; }}
+    #sidebar h2 {{ margin: 0 0 4px 0; font-size: 18px; }}
+    #sidebar .type {{ color: #71717a; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }}
+    #sidebar .metric {{ display: flex; justify-content: space-between; margin: 6px 0; font-size: 13px; }}
+    #sidebar .metric span:last-child {{ color: #a1a1aa; font-family: monospace; }}
+    #sidebar .bar {{ height: 4px; background: #27272a; border-radius: 2px; margin: 2px 0 10px; }}
+    #sidebar .bar > div {{ height: 100%; background: #3b82f6; border-radius: 2px; }}
+    #legend {{ position: absolute; top: 12px; left: 12px; background: rgba(24,24,27,0.9); border: 1px solid #27272a; border-radius: 6px; padding: 10px; font-size: 12px; }}
+    #legend .row {{ display: flex; align-items: center; margin: 3px 0; }}
+    #legend .swatch {{ width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; }}
+    #status {{ position: absolute; bottom: 12px; left: 12px; font-size: 11px; color: #52525b; font-family: monospace; }}
+    .node {{ cursor: pointer; }}
+    .node-label {{ font-size: 10px; fill: #a1a1aa; pointer-events: none; }}
+    .edge {{ stroke: #3f3f46; stroke-opacity: 0.4; }}
+  </style>
+</head>
+<body>
+  <svg id="graph"></svg>
+  <div id="sidebar">
+    <h2 id="sel-label">Click a node</h2>
+    <div class="type" id="sel-type"></div>
+    <div id="sel-metrics"></div>
+    <hr style="border-color:#27272a; margin: 16px 0;">
+    <div id="cluster-info"></div>
+  </div>
+  <div id="legend"></div>
+  <div id="status">Loading…</div>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script>
+    const DB_PATH = "{db_escaped}";
+    const PALETTE = ['#3b82f6','#ef4444','#10b981','#f59e0b','#8b5cf6','#ec4899','#14b8a6','#f97316','#6366f1','#84cc16','#06b6d4','#a855f7'];
+
+    const status = document.getElementById('status');
+    const url = `/v1/knowledge-graph/enriched-local?db=${{encodeURIComponent(DB_PATH)}}`;
+    status.textContent = `Fetching ${{url}}…`;
+
+    fetch(url).then(r => {{
+      if (!r.ok) return r.text().then(t => {{ throw new Error(`${{r.status}}: ${{t}}`); }});
+      return r.json();
+    }}).then(render).catch(e => {{
+      status.textContent = `ERROR: ${{e.message}}`;
+      status.style.color = '#ef4444';
+    }});
+
+    function render(data) {{
+      const {{ nodes, edges, clusters, modularity }} = data;
+      status.textContent = `${{nodes.length}} nodes · ${{edges.length}} edges · ${{clusters.length}} clusters · Q=${{modularity.toFixed(3)}}`;
+
+      // Legend
+      const legend = document.getElementById('legend');
+      legend.innerHTML = '<div style="font-weight:600;margin-bottom:6px;">Clusters</div>' +
+        clusters.map(c =>
+          `<div class="row"><span class="swatch" style="background:${{PALETTE[c.id % PALETTE.length]}}"></span>` +
+          `<span title="${{c.dominant_type}}, ${{c.node_count}} nodes">${{c.label}}</span></div>`
+        ).join('');
+
+      // Cluster lookup for sidebar
+      const clusterById = Object.fromEntries(clusters.map(c => [c.id, c]));
+
+      // d3-force expects {{source, target}} keys referencing node IDs
+      const links = edges.map(e => ({{ source: e.source_id, target: e.target_id, weight: e.weight }}));
+
+      const svg = d3.select('#graph');
+      const {{ width, height }} = svg.node().getBoundingClientRect();
+      svg.attr('viewBox', [0, 0, width, height]);
+
+      const g = svg.append('g');
+      svg.call(d3.zoom().scaleExtent([0.2, 5]).on('zoom', (e) => g.attr('transform', e.transform)));
+
+      const sim = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(links).id(d => d.id).distance(60).strength(l => Math.min(1, l.weight / 5)))
+        .force('charge', d3.forceManyBody().strength(-120))
+        .force('center', d3.forceCenter(width / 2, height / 2))
+        .force('collide', d3.forceCollide().radius(d => 6 + d.degree_centrality * 22));
+
+      const link = g.append('g').selectAll('line').data(links).join('line')
+        .attr('class', 'edge')
+        .attr('stroke-width', d => Math.min(5, 1 + d.weight * 0.4));
+
+      const node = g.append('g').selectAll('circle').data(nodes).join('circle')
+        .attr('class', 'node')
+        .attr('r', d => 4 + d.degree_centrality * 20)
+        .attr('fill', d => PALETTE[d.cluster_id % PALETTE.length])
+        .attr('stroke', d => d.betweenness_centrality > 0.1 ? '#fff' : 'none')
+        .attr('stroke-width', d => d.betweenness_centrality > 0.1 ? 2 : 0)
+        .on('click', (_, d) => selectNode(d, clusterById))
+        .call(drag(sim));
+
+      const label = g.append('g').selectAll('text').data(nodes).join('text')
+        .attr('class', 'node-label')
+        .text(d => d.degree_centrality > 0.15 ? d.label : '')
+        .attr('dy', -8);
+
+      sim.on('tick', () => {{
+        link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+        node.attr('cx', d => d.x).attr('cy', d => d.y);
+        label.attr('x', d => d.x).attr('y', d => d.y);
+      }});
+
+      // Auto-select highest-betweenness node
+      if (nodes.length) {{
+        const top = nodes.reduce((a, b) => a.betweenness_centrality > b.betweenness_centrality ? a : b);
+        selectNode(top, clusterById);
+      }}
+    }}
+
+    function selectNode(d, clusterById) {{
+      document.getElementById('sel-label').textContent = d.label;
+      document.getElementById('sel-type').textContent = `${{d.node_type}} · cluster #${{d.cluster_id}}`;
+      const m = document.getElementById('sel-metrics');
+      m.innerHTML = '';
+      for (const [name, val] of [
+        ['Degree', d.degree_centrality],
+        ['Betweenness', d.betweenness_centrality],
+        ['Closeness', d.closeness_centrality],
+      ]) {{
+        m.innerHTML += `<div class="metric"><span>${{name}}</span><span>${{val.toFixed(4)}}</span></div>` +
+                       `<div class="bar"><div style="width:${{Math.min(100, val*100).toFixed(1)}}%"></div></div>`;
+      }}
+      const c = clusterById[d.cluster_id];
+      if (c) {{
+        document.getElementById('cluster-info').innerHTML =
+          `<div style="font-weight:600;">Cluster: ${{c.label}}</div>` +
+          `<div style="font-size:12px;color:#71717a;">${{c.node_count}} nodes · ${{c.dominant_type}}</div>`;
+      }}
+    }}
+
+    function drag(sim) {{
+      return d3.drag()
+        .on('start', (e, d) => {{ if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }})
+        .on('drag', (e, d) => {{ d.fx = e.x; d.fy = e.y; }})
+        .on('end', (e, d) => {{ if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }});
+    }}
+  </script>
+</body>
+</html>"##
+    );
+    Html(html)
+}
+
 /// Build knowledge graph routes
 pub fn knowledge_graph_routes() -> Router<AppState> {
     Router::new()
@@ -386,4 +603,10 @@ pub fn knowledge_graph_routes() -> Router<AppState> {
         .route("/v1/knowledge-graph/enriched", get(get_enriched_graph))
         .route("/v1/knowledge-graph/rebuild", post(rebuild_knowledge_graph))
         .route("/v1/knowledge-graph", delete(delete_knowledge_graph))
+        // Local browser profile — unauth'd, reads app's SQLite directly
+        .route(
+            "/v1/knowledge-graph/enriched-local",
+            get(get_enriched_local),
+        )
+        .route("/persona", get(persona_profile_page))
 }
