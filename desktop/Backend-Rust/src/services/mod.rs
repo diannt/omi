@@ -1,6 +1,7 @@
 // Services module
 
 pub mod firestore;
+pub mod graph_analytics;
 pub mod integrations;
 pub mod local_db;
 pub mod opus_parser;
