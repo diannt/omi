@@ -165,6 +165,160 @@ pub fn fetch_memories_by_source(
 }
 
 // ===========================================================================
+// Dump segment tracking — resume support for interrupted transcription jobs.
+// Lives in its own table so the GRDB `memories` schema stays untouched.
+// ===========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentStatus {
+    Pending,
+    Transcribing,
+    Done,
+    Failed,
+}
+
+impl SegmentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            SegmentStatus::Pending => "pending",
+            SegmentStatus::Transcribing => "transcribing",
+            SegmentStatus::Done => "done",
+            SegmentStatus::Failed => "failed",
+        }
+    }
+    fn from_str(s: &str) -> Self {
+        match s {
+            "transcribing" => SegmentStatus::Transcribing,
+            "done" => SegmentStatus::Done,
+            "failed" => SegmentStatus::Failed,
+            _ => SegmentStatus::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DumpSegment {
+    pub id: i64,
+    pub dump_path: String,
+    pub segment_idx: i64,
+    pub start_offset: i64,
+    pub frame_count: i64,
+    pub status: SegmentStatus,
+    pub conversation_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Create the tracking table if absent. Safe to call multiple times.
+/// This table is owned by the Rust pipeline, not GRDB — no Swift migration needed.
+pub fn ensure_dump_segments_table(db_path: &Path) -> SqlResult<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usb_dump_segments (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            dumpPath        TEXT NOT NULL,
+            segmentIdx      INTEGER NOT NULL,
+            startOffset     INTEGER NOT NULL,
+            frameCount      INTEGER NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            conversationId  TEXT,
+            error           TEXT,
+            createdAt       TEXT NOT NULL,
+            updatedAt       TEXT NOT NULL,
+            UNIQUE(dumpPath, segmentIdx)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dump_seg_status
+            ON usb_dump_segments(dumpPath, status);",
+    )
+}
+
+/// Register segments discovered by the parser. Idempotent via INSERT OR IGNORE.
+/// Returns number of NEW rows inserted (already-registered segments are skipped).
+pub fn register_segments(
+    db_path: &Path,
+    dump_path: &str,
+    segments: &[(u64, usize)], // (start_offset, frame_count)
+) -> SqlResult<usize> {
+    ensure_dump_segments_table(db_path)?;
+    let mut conn = Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    let now = grdb_datetime(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    let mut n = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO usb_dump_segments \
+             (dumpPath, segmentIdx, startOffset, frameCount, status, createdAt, updatedAt) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5)",
+        )?;
+        for (idx, (offset, count)) in segments.iter().enumerate() {
+            n += stmt.execute(params![
+                dump_path,
+                idx as i64,
+                *offset as i64,
+                *count as i64,
+                now
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// Fetch segments still needing transcription.
+pub fn pending_segments(db_path: &Path, dump_path: &str) -> SqlResult<Vec<DumpSegment>> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, dumpPath, segmentIdx, startOffset, frameCount, status, conversationId, error \
+         FROM usb_dump_segments \
+         WHERE dumpPath = ?1 AND status IN ('pending', 'failed') \
+         ORDER BY segmentIdx",
+    )?;
+    let rows = stmt
+        .query_map(params![dump_path], |r| {
+            Ok(DumpSegment {
+                id: r.get(0)?,
+                dump_path: r.get(1)?,
+                segment_idx: r.get(2)?,
+                start_offset: r.get(3)?,
+                frame_count: r.get(4)?,
+                status: SegmentStatus::from_str(&r.get::<_, String>(5)?),
+                conversation_id: r.get(6)?,
+                error: r.get(7)?,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Mark a segment's status. `conversation_id` populated on success.
+pub fn mark_segment(
+    db_path: &Path,
+    segment_id: i64,
+    status: SegmentStatus,
+    conversation_id: Option<&str>,
+    error: Option<&str>,
+) -> SqlResult<()> {
+    let conn = Connection::open(db_path)?;
+    let now = grdb_datetime(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    conn.execute(
+        "UPDATE usb_dump_segments \
+         SET status = ?1, conversationId = ?2, error = ?3, updatedAt = ?4 \
+         WHERE id = ?5",
+        params![status.as_str(), conversation_id, error, now, segment_id],
+    )?;
+    Ok(())
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -319,6 +473,60 @@ mod tests {
         assert_eq!(vis, "private");
         assert_eq!(deleted, 0);
         assert!(backend_id.is_none()); // NULL, so sync service will pick it up
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[test]
+    fn segment_resume_flow() {
+        let db = temp_db();
+        let dump = "/tmp/test_dump.bin";
+
+        // First run: register 5 segments
+        let segs: Vec<(u64, usize)> = (0..5).map(|i| (i as u64 * 100_000, 6000)).collect();
+        let inserted = register_segments(&db, dump, &segs).unwrap();
+        assert_eq!(inserted, 5);
+
+        // All 5 pending
+        let pending = pending_segments(&db, dump).unwrap();
+        assert_eq!(pending.len(), 5);
+        assert_eq!(pending[0].segment_idx, 0);
+        assert_eq!(pending[0].start_offset, 0);
+        assert_eq!(pending[4].start_offset, 400_000);
+        assert!(pending.iter().all(|s| s.status == SegmentStatus::Pending));
+
+        // Mark segments 0,1,2 done; 3 failed
+        for i in 0..3 {
+            mark_segment(
+                &db,
+                pending[i].id,
+                SegmentStatus::Done,
+                Some(&format!("conv-{i}")),
+                None,
+            )
+            .unwrap();
+        }
+        mark_segment(
+            &db,
+            pending[3].id,
+            SegmentStatus::Failed,
+            None,
+            Some("transcription API 503"),
+        )
+        .unwrap();
+
+        // Resume: only 3 (failed) and 4 (pending) should return
+        let remaining = pending_segments(&db, dump).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].segment_idx, 3);
+        assert_eq!(remaining[0].status, SegmentStatus::Failed);
+        assert_eq!(remaining[0].error.as_deref(), Some("transcription API 503"));
+        assert_eq!(remaining[1].segment_idx, 4);
+        assert_eq!(remaining[1].status, SegmentStatus::Pending);
+
+        // Re-register is idempotent (UNIQUE on dumpPath+segmentIdx)
+        let reinserted = register_segments(&db, dump, &segs).unwrap();
+        assert_eq!(reinserted, 0, "re-register should insert nothing");
+
         std::fs::remove_file(&db).ok();
     }
 
